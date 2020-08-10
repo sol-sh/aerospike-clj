@@ -7,13 +7,16 @@
             [manifold.deferred :as d])
   (:import [com.aerospike.client AerospikeClient Host Key Bin Record AerospikeException Operation BatchRead AerospikeException$QueryTerminated]
            [com.aerospike.client.async EventLoop NioEventLoops]
-           [com.aerospike.client.listener RecordListener WriteListener DeleteListener ExistsListener BatchListListener RecordSequenceListener
+           [com.aerospike.client.listener RecordSequenceListener
                                           InfoListener ExistsArrayListener]
            [com.aerospike.client.policy Policy BatchPolicy ClientPolicy RecordExistsAction WritePolicy ScanPolicy InfoPolicy]
            [com.aerospike.client.cluster Node]
            [clojure.lang IPersistentMap IPersistentVector]
            [java.util List Collection ArrayList Map]
-           [java.time Instant]))
+           [java.util.concurrent CompletableFuture]
+           [java.time Instant]
+           [aerospike_clj.listeners AsyncRecordListener AsyncExistsListener AsyncBatchListListener
+            AsyncDeleteListener AsyncWriteListener]))
 
 (declare record->map)
 
@@ -98,34 +101,11 @@
 (defn- register-events [op-future db op-name index op-start-time]
   (doseq [ce (:client-events db)]
     (-> op-future
-        (d/chain' (fn [op-result]
+        (d/chain (fn [op-result]
                     (on-success ce op-name op-result    index op-start-time db)))
-        (d/catch' (fn [op-exception]
-                    (on-failure ce op-name op-exception index op-start-time db)))))
+        (d/catch (fn [op-exception]
+                   (on-failure ce op-name op-exception index op-start-time db)))))
   op-future)
-
-(defn- ^ExistsListener reify-exists-listener [op-future]
-  (reify ExistsListener
-    (^void onFailure [_this ^AerospikeException ex]
-      (d/error! op-future ex))
-    (^void onSuccess [_this ^Key _k ^boolean exists]
-      (d/success! op-future exists))))
-
-(defn- ^DeleteListener reify-delete-listener [op-future]
-  (reify
-    DeleteListener
-    (^void onSuccess [_this ^Key _k ^boolean existed]
-      (d/success! op-future existed))
-    (^void onFailure [_ ^AerospikeException ex]
-      (d/error! op-future ex))))
-
-(defn- ^WriteListener reify-write-listener [op-future]
-  (reify
-    WriteListener
-    (^void onSuccess [_this ^Key _]
-      (d/success! op-future true))
-    (^void onFailure [_this ^AerospikeException ex]
-      (d/error! op-future ex))))
 
 (defn- ^InfoListener reify-info-listener [op-future]
   (reify
@@ -134,13 +114,6 @@
       (d/success! op-future (into {} result-map)))
     (^void onFailure [_this ^AerospikeException ex]
       (d/error! op-future ex))))
-
-(defn- ^RecordListener reify-record-listener [op-future]
-  (reify RecordListener
-    (^void onFailure [_this ^AerospikeException ex]
-      (d/error! op-future ex))
-    (^void onSuccess [_this ^Key _k ^Record record]
-      (d/success! op-future record))))
 
 (defn- ^RecordSequenceListener reify-record-sequence-listener [op-future callback]
   (reify RecordSequenceListener
@@ -153,13 +126,6 @@
       (if (instance? AerospikeException$QueryTerminated exception)
         (d/success! op-future false)
         (d/error! op-future exception)))))
-
-(defn- ^BatchListListener reify-record-batch-list-listener [op-future]
-  (reify BatchListListener
-    (^void onFailure [_this ^AerospikeException ex]
-      (d/error! op-future ex))
-    (^void onSuccess [_this ^List records]
-      (d/success! op-future records))))
 
 (defn- ^ExistsArrayListener reify-exists-array-listener [op-future]
   (reify ExistsArrayListener
@@ -239,7 +205,8 @@
 
 (defn _get [db index set-name conf bin-names]
   (let [client (get-client db index)
-        op-future (d/deferred)
+        ;; op-future (d/deferred)
+        op-future (CompletableFuture.) 
         start-time (System/nanoTime)]
     (if (and (= [:all] bin-names)
              (not (utils/single-bin? bin-names)))
@@ -247,17 +214,17 @@
       ;; the `get` method does not require bin-names and the whole record is retrieved
       (.get ^AerospikeClient client
             ^EventLoop (.next ^NioEventLoops (:el db))
-            (reify-record-listener op-future)
+            (AsyncRecordListener. op-future)
             ^Policy (:policy conf)
             (create-key index (:dbns db) set-name))
       ;; For all other cases, bin-names are passed to a different `get` method
       (.get ^AerospikeClient client
             ^EventLoop (.next ^NioEventLoops (:el db))
-            (reify-record-listener op-future)
+            (AsyncRecordListener. op-future)
             ^Policy (:policy conf)
             (create-key index (:dbns db) set-name)
             ^"[Ljava.lang.String;" (utils/v->array String bin-names)))
-    (let [d (d/chain' op-future
+    (let [d (d/chain op-future
                       record->map
                       (:transcoder conf identity))]
       (register-events d db "read" index start-time))))
@@ -286,15 +253,15 @@
    (get-batch db batch-reads {}))
   ([db batch-reads conf]
    (let [client (get-client db (:index (first batch-reads)))
-         op-future (d/deferred)
+         op-future (CompletableFuture.)
          start-time (System/nanoTime)
          batch-reads-arr (ArrayList. ^Collection (mapv #(map->batch-read % (:dbns db)) batch-reads))]
      (.get ^AerospikeClient client
            ^EventLoop (.next ^NioEventLoops (:el db))
-           (reify-record-batch-list-listener op-future)
+           (AsyncBatchListListener. op-future)
            ^BatchPolicy (:policy conf)
            ^List batch-reads-arr)
-     (let [d (d/chain' op-future
+     (let [d (d/chain op-future
                       #(mapv batch-read->map %)
                       (:transcoder conf identity))]
       (register-events d db "read-batch" nil start-time)))))
@@ -316,7 +283,7 @@
               (reify-exists-array-listener op-future)
               ^BatchPolicy (:policy conf)
               ^"[Lcom.aerospike.client.Key;" indices)
-     (let [d (d/chain' op-future
+     (let [d (d/chain op-future
                        vec
                        (:transcoder conf identity))]
        (register-events d db "exists-batch" nil start-time)))))
@@ -340,11 +307,11 @@
   ([db index set-name] (exists? db index set-name {}))
   ([db index set-name conf]
    (let [client (get-client db index)
-         op-future (d/deferred)
+         op-future (CompletableFuture.)
          start-time (System/nanoTime)]
      (.exists ^AerospikeClient client
               ^EventLoop (.next ^NioEventLoops (:el db))
-              (reify-exists-listener op-future)
+              (AsyncExistsListener. op-future)
               ^Policy (:policy conf)
               (create-key index (:dbns db) set-name))
      (register-events op-future db "exists" index start-time))))
@@ -359,11 +326,11 @@
 (defn- _put [db index data policy set-name]
   (let [client (get-client db index)
         bins (data->bins data)
-        op-future (d/deferred)
+        op-future (CompletableFuture.)
         start-time (System/nanoTime)]
     (.put ^AerospikeClient client
           ^EventLoop (.next ^NioEventLoops (:el db))
-          ^WriteListener (reify-write-listener op-future)
+          (AsyncWriteListener. op-future)
           ^WritePolicy policy
           (create-key index (:dbns db) set-name)
           ^"[Lcom.aerospike.client.Bin;" bins)
@@ -391,7 +358,7 @@
   ([db indices set-names payloads expirations]
    (put-multiple db indices set-names payloads expirations {}))
   ([db indices set-names payloads expirations conf]
-   (apply d/zip'
+   (apply d/zip
           (map (fn [[index set-name payload expiration]]
                  (put db index set-name payload expiration conf))
                (map vector indices set-names payloads expirations)))))
@@ -460,11 +427,11 @@
   Expects records to exist."
   [db index set-name expiration]
   (let [client (get-client db index)
-        op-future (d/deferred)
+        op-future (CompletableFuture.)
         start-time (System/nanoTime)]
     (.touch ^AerospikeClient client
             ^EventLoop (.next ^NioEventLoops (:el db))
-            ^WriteListener (reify-write-listener op-future)
+            (AsyncWriteListener. op-future)
             ^WritePolicy (policy/write-policy client expiration RecordExistsAction/UPDATE_ONLY)
             (create-key index (:dbns db) set-name))
     (register-events op-future db "touch" index start-time)))
@@ -478,22 +445,22 @@
    (delete db index set-name {}))
   ([db index set-name conf]
    (let [client (get-client db index)
-         op-future (d/deferred)
+         op-future (CompletableFuture.)
          start-time (System/nanoTime)]
      (.delete ^AerospikeClient client
               ^EventLoop (.next ^NioEventLoops (:el db))
-              ^DeleteListener (reify-delete-listener op-future)
+              (AsyncDeleteListener. op-future)
               ^WritePolicy (:policy conf)
               (create-key index (:dbns db) set-name))
      (register-events op-future db "delete" index start-time))))
 
 (defn- _delete-bins [db index bin-names policy set-name]
   (let [client (get-client db index)
-        op-future (d/deferred)
+        op-future (CompletableFuture.)
         start-time (System/nanoTime)]
     (.put ^AerospikeClient client
           ^EventLoop (.next ^NioEventLoops (:el db))
-          ^WriteListener (reify-write-listener op-future)
+          (AsyncWriteListener. op-future)
           ^WritePolicy policy
           (create-key index (:dbns db) set-name)
           ^"[Lcom.aerospike.client.Bin;" (utils/v->array Bin (mapv set-bin-as-null bin-names)))
@@ -523,15 +490,15 @@
    (if (empty? operations)
      (d/success-deferred nil)
      (let [client (get-client db index)
-           op-future (d/deferred)
+           op-future (CompletableFuture.)
            start-time (System/nanoTime)]
        (.operate ^AerospikeClient client
                  ^EventLoop (.next ^NioEventLoops (:el db))
-                 ^RecordListener (reify-record-listener op-future)
+                 (AsyncRecordListener. op-future)
                  ^WritePolicy (:policy conf (policy/write-policy client expiration RecordExistsAction/UPDATE))
                  (create-key index (:dbns db) set-name)
                  (utils/v->array Operation operations))
-       (register-events (d/chain' op-future record->map) db "operate" index start-time)))))
+       (register-events (d/chain op-future record->map) db "operate" index start-time)))))
 
 (defn scan-set
   "Scans through the given set and calls a user defined callback for each record that was found.

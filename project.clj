@@ -20,3 +20,4 @@
                                   [danlentz/clj-uuid "0.1.9"]
                                   [com.fasterxml.jackson.core/jackson-databind "2.11.1"]]
                    :global-vars {*warn-on-reflection* true}}})
+                   ;; :jvm-opts ["-Xlint:unchecked"]}})

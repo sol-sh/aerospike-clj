@@ -261,6 +261,7 @@
 (deftest put-replace-only-raises-exception
   (is (thrown-with-msg? AerospikeException #"Key not found"
                         @(client/replace-only *c* "not here" _set 1 TTL))))
+
 (deftest delete
   (let [k (random-key)]
     (is (true? @(client/put *c* k _set 1 TTL)))
